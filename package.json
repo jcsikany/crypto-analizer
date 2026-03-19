@@ -1,0 +1,21 @@
+{
+  "name": "btc-analyzer-server",
+  "version": "1.0.0",
+  "description": "Signal engine server for BTC Analyzer push notifications",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
+    "expo-server-sdk": "^3.10.0",
+    "node-cron": "^3.0.3",
+    "better-sqlite3": "^9.4.3",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
