@@ -19,6 +19,7 @@ function extractOHLCV(candles) {
 
 function EMA(data, period) {
   const result = new Array(data.length).fill(null);
+  if (data.length < period) return result; // sin datos suficientes: todo null
   const k = 2 / (period + 1);
   let s = 0;
   for (let i = 0; i < period; i++) s += data[i];

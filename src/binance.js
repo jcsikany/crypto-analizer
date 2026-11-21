@@ -1,19 +1,16 @@
 // ─── KuCoin API (sin restricciones geo) ──────────────────────────────────
 const fetch = require('node-fetch');
+const { klineTimeRange } = require('./klineWindow');
 
 const BASE = 'https://api.kucoin.com/api/v1';
 
-const INTERVAL_MAP = {
-  '15m': '15min',
-  '1h':  '1hour',
-  '4h':  '4hour',
-  '1d':  '1day',
-};
+// 300 velas: EMA200 necesita 200 para arrancar y ~100 más para estabilizarse
+const CANDLES_PER_TF = 300;
 
-async function fetchKlines(symbol, interval, limit = 200) {
-  const kuSymbol   = symbol.replace('USDT', '-USDT'); // BTCUSDT → BTC-USDT
-  const kuInterval = INTERVAL_MAP[interval] || interval;
-  const url = `${BASE}/market/candles?type=${kuInterval}&symbol=${kuSymbol}`;
+async function fetchKlines(symbol, interval, limit = CANDLES_PER_TF) {
+  const kuSymbol = symbol.replace('USDT', '-USDT'); // BTCUSDT → BTC-USDT
+  const { type, startAt, endAt } = klineTimeRange(interval, limit);
+  const url = `${BASE}/market/candles?type=${type}&symbol=${kuSymbol}&startAt=${startAt}&endAt=${endAt}`;
 
   const res = await fetch(url, { timeout: 10000 });
   if (!res.ok) throw new Error(`KuCoin klines ${res.status}`);
@@ -22,7 +19,7 @@ async function fetchKlines(symbol, interval, limit = 200) {
 
   // KuCoin devuelve: [time, open, close, high, low, volume, turnover]
   // Orden: más reciente primero — invertir y limitar
-  return json.data
+  const candles = (json.data || [])
     .slice(0, limit)
     .reverse()
     .map(k => ({
@@ -33,6 +30,11 @@ async function fetchKlines(symbol, interval, limit = 200) {
       low:    parseFloat(k[4]),
       volume: parseFloat(k[5]),
     }));
+
+  if (candles.length < 200) {
+    console.warn(`[KuCoin] ${symbol} ${interval}: solo ${candles.length} velas (EMA200 no disponible)`);
+  }
+  return candles;
 }
 
 async function fetchTicker(symbol) {
@@ -56,10 +58,10 @@ async function fetchTicker(symbol) {
 
 async function fetchAllKlines(symbol) {
   const [k15m, k1h, k4h, k1d] = await Promise.all([
-    fetchKlines(symbol, '15m', 200),
-    fetchKlines(symbol, '1h',  200),
-    fetchKlines(symbol, '4h',  200),
-    fetchKlines(symbol, '1d',  200),
+    fetchKlines(symbol, '15m'),
+    fetchKlines(symbol, '1h'),
+    fetchKlines(symbol, '4h'),
+    fetchKlines(symbol, '1d'),
   ]);
   return { '15m': k15m, '1h': k1h, '4h': k4h, '1d': k1d };
 }

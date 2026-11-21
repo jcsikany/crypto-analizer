@@ -10,6 +10,7 @@ const {
   getSignalHistory, getSignalStats, evaluateAccuracy,
 } = require('./database');
 const { runBacktest, THRESHOLD_PRESETS } = require('./backtestEngine');
+const { getAccumulationState } = require('./accumulationService');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -147,6 +148,15 @@ app.get('/fundamentals/:asset', auth, (req, res) => {
     return res.status(404).json({ error: 'Sin datos fundamentales aún' });
   }
   res.json(fundamentals[asset]);
+});
+
+// ─── Acumulación de largo plazo (BTC) ────────────────────────────────────────
+app.get('/accumulation', auth, (req, res) => {
+  const state = getAccumulationState();
+  if (!state) {
+    return res.status(503).json({ error: 'Análisis de acumulación aún no disponible' });
+  }
+  res.json({ ...state, livePrice: getLastAnalysis().BTC?.price ?? null });
 });
 
 // ─── Historial de señales ────────────────────────────────────────────────────

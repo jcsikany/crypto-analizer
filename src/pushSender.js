@@ -1,6 +1,6 @@
 // ─── Push Notification Sender v2 — Enhanced Context ──────────────────────────
 const { Expo } = require('expo-server-sdk');
-const { canSendAlert, logAlert, removeDevice } = require('./database');
+const { canSendAlert, logAlert, removeDevice, getAlertConfig } = require('./database');
 
 const expo = new Expo();
 
@@ -27,7 +27,7 @@ async function evaluateAndNotify(devices, masterSignal, asset) {
   for (const device of devices) {
     if (device.asset !== asset) continue;
 
-    const config = require('./database').getAlertConfig(device.push_token);
+    const config = getAlertConfig(device.push_token);
     if (!config.enabled) continue;
     if (!Expo.isExpoPushToken(device.push_token)) {
       console.warn(`Token inválido: ${device.push_token}`);
@@ -93,9 +93,45 @@ async function evaluateAndNotify(devices, masterSignal, asset) {
     });
   }
 
+  await sendChunks(notifications);
+}
+
+// ─── Alertas de acumulación de largo plazo (BTC, todos los dispositivos) ─────
+
+async function sendAccumulationAlert(devices, alert, evaluation) {
+  const asset = 'BTC';
+  const score = evaluation.metrics.priceToWma ?? 0;
+  const notifications = [];
+
+  for (const device of devices) {
+    const config = getAlertConfig(device.push_token);
+    if (!config.longTermEnabled) continue;
+    if (!Expo.isExpoPushToken(device.push_token)) continue;
+    if (!canSendAlert(device.push_token, asset, alert.alertType, alert.cooldownMinutes)) continue;
+
+    notifications.push({
+      to:    device.push_token,
+      sound: 'default',
+      title: alert.title,
+      body:  alert.body,
+      data:  {
+        type: alert.alertType, asset, zone: evaluation.zone,
+        asOf: evaluation.asOf, screen: 'Accumulation',
+      },
+      priority: 'high',
+      channelId: 'signal-alerts',
+      _meta: { pushToken: device.push_token, asset, alertType: alert.alertType, score },
+    });
+  }
+
+  await sendChunks(notifications);
+}
+
+// ─── Envío en chunks + manejo de tickets ─────────────────────────────────────
+
+async function sendChunks(notifications) {
   if (notifications.length === 0) return;
 
-  // Enviar en chunks
   const chunks = expo.chunkPushNotifications(notifications);
   console.log(`[PUSH] Enviando ${notifications.length} notificacion(es) en ${chunks.length} chunk(s)`);
 
@@ -121,4 +157,4 @@ async function evaluateAndNotify(devices, masterSignal, asset) {
   }
 }
 
-module.exports = { evaluateAndNotify };
+module.exports = { evaluateAndNotify, sendAccumulationAlert };

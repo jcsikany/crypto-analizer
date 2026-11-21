@@ -17,12 +17,28 @@ const {
   findSwingLevels,
 } = require('./indicators');
 
-const { detectRegime, getAdaptiveThresholds, REGIMES } = require('./regimeDetector');
+const { detectRegime, getAdaptiveThresholds, REGIME_CONFIDENCE } = require('./regimeDetector');
 
 const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
 
 // ─── Timeframe weights (base) ────────────────────────────────────────────────
 const TF_WEIGHTS = { '15m': 0.10, '1h': 0.20, '4h': 0.35, '1d': 0.35 };
+
+// Score de un TF a partir del cual cuenta como alcista/bajista para confluencia
+const TF_DIRECTION_THRESHOLD = 0.3;
+
+// ─── Calibración de escala ───────────────────────────────────────────────────
+// El score crudo promedia ~70 indicadores en 4 capas (indicador → categoría →
+// timeframe → maestro), y trend-following vs. mean-reversion se cancelan entre
+// sí. Resultado: el crudo vive en ~±0.3 y los umbrales (0.4 / 0.7 / 1.3) eran
+// inalcanzables. Esta escala lleva el score a un rango donde esos umbrales
+// tienen sentido. Calibrada con 120 días de historia BTC+ETH (evaluando cada 4h,
+// sin fundamentales), el |score| quedó así:
+//   >= 0.4 (BUY/SELL base)      ~42% del tiempo
+//   >= 0.7 (alerta moderada)    ~16%
+//   >= 1.3 (alerta fuerte)      ~0.6%  (antes: 0%, el máximo histórico era 0.38)
+// Recalibrar si se cambian indicadores, pesos o la lógica de confluencia.
+const SCORE_SCALE = 4.5;
 
 // ─── Score → Signal ──────────────────────────────────────────────────────────
 
@@ -457,6 +473,47 @@ function analyzeTimeframe(candles, tf, regimeOverride = null) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// CONFIDENCE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// |score| a partir del cual la magnitud aporta el 100% (= umbral de alerta fuerte)
+const CONFIDENCE_FULL_SCORE = 1.3;
+// Score escalado de un TF que cuenta como acuerdo pleno (= umbral de alerta moderada)
+const CONFIDENCE_FULL_TF = 0.7;
+
+/**
+ * Confianza 0–100 en la dirección de la señal. Combina:
+ *  - magnitud: qué tan cerca está |score| del umbral fuerte
+ *  - alineación: promedio ponderado (pesos de TF) de cuánto empuja cada TF a
+ *    favor (+) o en contra (−) de la señal; los TF en contra restan
+ *  - régimen: menos confianza en rango o alta volatilidad
+ * Se usa la media geométrica de magnitud y alineación porque ambas salen de
+ * los mismos TF; el producto simple las penalizaba dos veces.
+ * @param {number} finalScore  score maestro escalado (−2..2)
+ * @param {{ tf: string, score: number }[]} scaledTfs  scores por TF escalados
+ * @param {string} regime  régimen dominante
+ * @returns {number} entero 0..100
+ */
+function computeConfidence(finalScore, scaledTfs, regime) {
+  if (!finalScore || !Number.isFinite(finalScore)) return 0;
+  const dir = Math.sign(finalScore);
+  const magnitude = Math.min(1, Math.abs(finalScore) / CONFIDENCE_FULL_SCORE);
+
+  let weightSum = 0;
+  let aligned = 0;
+  for (const { tf, score } of scaledTfs) {
+    if (!Number.isFinite(score)) continue; // un TF roto no debe volver NaN la confianza
+    const w = TF_WEIGHTS[tf] ?? 0.2;
+    weightSum += w;
+    aligned += w * clamp((score * dir) / CONFIDENCE_FULL_TF, -1, 1);
+  }
+  const alignment = weightSum > 0 ? Math.max(0, aligned / weightSum) : 0;
+
+  const regimeFactor = REGIME_CONFIDENCE[regime] ?? 0.8;
+  return clamp(Math.round(100 * Math.sqrt(magnitude * alignment) * regimeFactor), 0, 100);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MASTER SIGNAL — Multi-TF Confluence + Fundamentals
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -467,7 +524,6 @@ function computeMasterSignal(tfAnalyses, fundamentals = null) {
   // ─── 1. Detect dominant regime from 4h and 1d (longer timeframes) ─────
   const regimeSource = tfAnalyses['1d'] || tfAnalyses['4h'] || available[0][1];
   const dominantRegime = regimeSource.regime;
-  const regimeInfo = detectRegime; // stored for reference
 
   // ─── 2. Adaptive thresholds ───────────────────────────────────────────
   const thresholds = getAdaptiveThresholds(dominantRegime, 0);
@@ -483,24 +539,28 @@ function computeMasterSignal(tfAnalyses, fundamentals = null) {
 
   // ─── 4. Confluence check ──────────────────────────────────────────────
   // Count how many timeframes agree on direction
-  const counts = { bullish: 0, bearish: 0, neutral: 0, total: available.length };
+  const tally = { bullish: 0, bearish: 0, neutral: 0 };
   available.forEach(([, a]) => {
-    if (a.score > 0.3) counts.bullish++;
-    else if (a.score < -0.3) counts.bearish++;
-    else counts.neutral++;
+    if (a.score > TF_DIRECTION_THRESHOLD) tally.bullish++;
+    else if (a.score < -TF_DIRECTION_THRESHOLD) tally.bearish++;
+    else tally.neutral++;
   });
 
   // Confluence ratio: what % of timeframes agree with the dominant direction
-  const dominantDir = techWeighted > 0 ? 'bullish' : 'bearish';
-  const agreeCount = dominantDir === 'bullish' ? counts.bullish : counts.bearish;
+  const dominantDir = techWeighted >= 0 ? 'bullish' : 'bearish';
+  const agreeCount = dominantDir === 'bullish' ? tally.bullish : tally.bearish;
+  const opposingCount = dominantDir === 'bullish' ? tally.bearish : tally.bullish;
+  const counts = { ...tally, opposing: opposingCount, total: available.length };
   const confluenceRatio = counts.total > 0 ? agreeCount / counts.total : 0;
 
-  // Confluence penalty: if less than 50% agree, reduce score significantly
+  // Confluence penalty: solo penalizan los TF que apuntan en CONTRA.
+  // Un TF neutral no contradice nada (antes contaba como desacuerdo y casi
+  // siempre multiplicaba por 0.6 o 0.3).
+  const opposingRatio = counts.total > 0 ? opposingCount / counts.total : 0;
   let confluenceMultiplier = 1;
-  if (confluenceRatio < 0.25) confluenceMultiplier = 0.3;      // almost no agreement
-  else if (confluenceRatio < 0.5) confluenceMultiplier = 0.6;  // weak agreement
-  else if (confluenceRatio < 0.75) confluenceMultiplier = 0.85; // moderate agreement
-  // >= 75% = full conviction
+  if (opposingRatio > 0.5) confluenceMultiplier = 0.3;        // mayoría en contra
+  else if (opposingRatio > 0.25) confluenceMultiplier = 0.6;  // conflicto serio
+  else if (opposingRatio > 0) confluenceMultiplier = 0.85;    // un TF en contra
 
   // ─── 5. Integrate fundamental score ───────────────────────────────────
   let fundamentalScore = 0;
@@ -512,31 +572,24 @@ function computeMasterSignal(tfAnalyses, fundamentals = null) {
 
   // ─── 6. Compute final score ───────────────────────────────────────────
   const technicalWeight = 1 - fundamentalWeight;
-  let finalScore = (techWeighted * technicalWeight + fundamentalScore * fundamentalWeight);
+  const blended = techWeighted * technicalWeight + fundamentalScore * fundamentalWeight;
 
-  // Apply confluence multiplier
-  finalScore *= confluenceMultiplier;
-
-  // Clamp
-  finalScore = clamp(finalScore, -2, 2);
+  // Score crudo (con confluencia) y score calibrado a la escala de los umbrales
+  const rawScore = clamp(blended * confluenceMultiplier, -2, 2);
+  const finalScore = clamp(rawScore * SCORE_SCALE, -2, 2);
 
   // ─── 7. Determine signal with adaptive thresholds ─────────────────────
   const signal = scoreToSignal(finalScore, thresholds);
 
   // ─── 8. Confidence calculation ────────────────────────────────────────
-  // Base confidence from score magnitude
-  let confidence = Math.min(100, Math.round(Math.abs(finalScore / 2) * 100));
-
-  // Boost confidence for high confluence
-  confidence = Math.round(confidence * confluenceRatio);
-
-  // Regime confidence modifier
-  const regimeConf = {
-    STRONG_TREND_UP: 1.0, TREND_UP: 0.95, RANGING: 0.75,
-    TREND_DOWN: 0.95, STRONG_TREND_DOWN: 1.0, HIGH_VOLATILITY: 0.60,
-  };
-  confidence = Math.round(confidence * (regimeConf[dominantRegime] ?? 0.8));
-  confidence = Math.min(100, Math.max(0, confidence));
+  // TF scores en la misma escala que el maestro (también para tfBreakdown)
+  const scaledTfs = available.map(([tf, a]) => ({
+    tf,
+    score: clamp(a.score * SCORE_SCALE, -2, 2),
+    rawScore: a.score,
+    regime: a.regime,
+  }));
+  const confidence = computeConfidence(finalScore, scaledTfs, dominantRegime);
 
   // ─── 9. Zone determination ────────────────────────────────────────────
   let zone = 'NEUTRAL';
@@ -552,6 +605,7 @@ function computeMasterSignal(tfAnalyses, fundamentals = null) {
   return {
     signal,
     score: +finalScore.toFixed(4),
+    rawScore: +rawScore.toFixed(4),
     confidence,
     zone,
     regime: dominantRegime,
@@ -571,14 +625,18 @@ function computeMasterSignal(tfAnalyses, fundamentals = null) {
         change7d: fundamentals.defiTVL.change7d,
       } : null,
     } : null,
-    tfBreakdown: available.map(([tf, a]) => ({
-      tf,
-      score: +a.score.toFixed(3),
-      signal: scoreToSignal(a.score, thresholds),
-      regime: a.regime,
+    // Mismo escalado que el maestro, para que señal por TF y maestra sean comparables
+    tfBreakdown: scaledTfs.map(t => ({
+      tf: t.tf,
+      score: +t.score.toFixed(3),
+      rawScore: +t.rawScore.toFixed(3),
+      signal: scoreToSignal(t.score, thresholds),
+      regime: t.regime,
     })),
     timestamp: Date.now(),
   };
 }
 
-module.exports = { analyzeTimeframe, computeMasterSignal, scoreToSignal };
+module.exports = {
+  analyzeTimeframe, computeMasterSignal, computeConfidence, scoreToSignal, SCORE_SCALE,
+};

@@ -5,6 +5,11 @@ const { analyzeTimeframe, computeMasterSignal } = require('./signalEngine');
 const { getAllDevices, saveSignalHistory, cleanOldHistory } = require('./database');
 const { evaluateAndNotify } = require('./pushSender');
 const { fetchAllFundamentals } = require('./marketApis');
+const { runAccumulation } = require('./accumulationService');
+
+// Acumulación de largo plazo: una vez por día (CoinMetrics publica el día
+// anterior durante la madrugada UTC) y al arrancar.
+const ACCUMULATION_CRON = '15 6 * * *';
 
 // Estado en memoria
 const lastAnalysis = {};
@@ -133,11 +138,14 @@ function startScheduler(intervalMinutes = 1) {
     cleanOldHistory(30);
   });
 
+  cron.schedule(ACCUMULATION_CRON, () => runAccumulation(), { timezone: 'UTC' });
+
   // Correr inmediatamente al iniciar
   setTimeout(async () => {
     const assets = getActiveAssets();
     await Promise.allSettled(assets.map(asset => runAnalysis(asset)));
   }, 2000);
+  setTimeout(() => runAccumulation(), 5000);
 }
 
 function getLastAnalysis() {

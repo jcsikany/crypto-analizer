@@ -66,6 +66,12 @@ db.exec(`
     ON signal_history(asset, signal, created_at);
 `);
 
+// Migración idempotente: alertas de acumulación de largo plazo (on por defecto)
+const alertConfigColumns = db.prepare('PRAGMA table_info(alert_configs)').all().map(c => c.name);
+if (!alertConfigColumns.includes('long_term_enabled')) {
+  db.exec('ALTER TABLE alert_configs ADD COLUMN long_term_enabled INTEGER NOT NULL DEFAULT 1');
+}
+
 // ─── Devices ─────────────────────────────────────────────────────────────────
 
 function upsertDevice(pushToken, asset = 'BTC') {
@@ -91,14 +97,21 @@ function removeDevice(pushToken) {
 // ─── Alert configs ───────────────────────────────────────────────────────────
 
 function upsertAlertConfig(pushToken, config) {
+  // Si el cliente no manda longTermEnabled (app vieja), se conserva el valor guardado
+  const existing = db.prepare('SELECT long_term_enabled FROM alert_configs WHERE push_token = ?').get(pushToken);
+  const longTermEnabled = typeof config.longTermEnabled === 'boolean'
+    ? (config.longTermEnabled ? 1 : 0)
+    : (existing?.long_term_enabled ?? 1);
+
   db.prepare(`
-    INSERT INTO alert_configs (push_token, enabled, strong_threshold, moderate_threshold, cooldown_minutes, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO alert_configs (push_token, enabled, strong_threshold, moderate_threshold, cooldown_minutes, long_term_enabled, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(push_token) DO UPDATE SET
       enabled            = excluded.enabled,
       strong_threshold   = excluded.strong_threshold,
       moderate_threshold = excluded.moderate_threshold,
       cooldown_minutes   = excluded.cooldown_minutes,
+      long_term_enabled  = excluded.long_term_enabled,
       updated_at         = excluded.updated_at
   `).run(
     pushToken,
@@ -106,6 +119,7 @@ function upsertAlertConfig(pushToken, config) {
     config.strongThreshold   ?? 1.3,
     config.moderateThreshold ?? 0.7,
     config.cooldownMinutes   ?? 60,
+    longTermEnabled,
     Date.now()
   );
 }
@@ -115,12 +129,14 @@ function getAlertConfig(pushToken) {
   if (!row) return {
     enabled: true, strongThreshold: 1.3,
     moderateThreshold: 0.7, cooldownMinutes: 60,
+    longTermEnabled: true,
   };
   return {
     enabled:            !!row.enabled,
     strongThreshold:    row.strong_threshold,
     moderateThreshold:  row.moderate_threshold,
     cooldownMinutes:    row.cooldown_minutes,
+    longTermEnabled:    row.long_term_enabled !== 0,
   };
 }
 

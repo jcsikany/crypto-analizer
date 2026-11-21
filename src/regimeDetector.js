@@ -101,11 +101,10 @@ function detectRegime(candles) {
   const slope21 = calculateSlope(ema21, 5);
   const slope50 = calculateSlope(ema50, 10);
 
-  // 5. Price position relative to EMAs
-  const aboveEma21  = price > (ema21[n-1] ?? price);
-  const aboveEma50  = price > (ema50[n-1] ?? price);
-  const aboveEma200 = price > (ema200[n-1] ?? price);
-  const emaAlignment = (aboveEma21 ? 1 : -1) + (aboveEma50 ? 1 : -1) + (aboveEma200 ? 1 : -1);
+  // 5. Price position relative to EMAs (+1 arriba, -1 abajo, 0 si la EMA no
+  //    tiene datos suficientes — antes contaba como "abajo" y sesgaba a la baja)
+  const sidePos = (ema) => (ema === null || ema === undefined ? 0 : price > ema ? 1 : -1);
+  const emaAlignment = sidePos(ema21[n-1]) + sidePos(ema50[n-1]) + sidePos(ema200[n-1]);
 
   // ─── Lógica de clasificación ───────────────────────────────────────────
 

@@ -5,11 +5,18 @@ const { analyzeTimeframe, computeMasterSignal, scoreToSignal } = require('./sign
 const BASE = 'https://api.kucoin.com/api/v1';
 
 // ─── Threshold presets ──────────────────────────────────────────────────────
+// Para la escala calibrada del score (SCORE_SCALE en signalEngine). Elegidos
+// por nivel de actividad, NO optimizando el retorno del backtest (overfitting).
+// % = lecturas históricas con |score| >= buy (120d BTC+ETH, cada 4h):
+//   conservative  buy 0.7 → ~16%  (= alerta moderada / fuerte de la app)
+//   normal        buy 0.4 → ~41%  (= umbral base del servidor en vivo)
+//   aggressive    buy 0.3 → ~54%
+//   veryAggressive buy 0.2 → ~69%
 const THRESHOLD_PRESETS = {
-  conservative: { strongBuy: 1.3, buy: 0.4, sell: -0.4, strongSell: -1.3 },
-  normal:       { strongBuy: 1.0, buy: 0.3, sell: -0.3, strongSell: -1.0 },
-  aggressive:   { strongBuy: 0.7, buy: 0.2, sell: -0.2, strongSell: -0.7 },
-  veryAggressive: { strongBuy: 0.5, buy: 0.15, sell: -0.15, strongSell: -0.5 },
+  conservative:   { strongBuy: 1.3, buy: 0.7, sell: -0.7, strongSell: -1.3 },
+  normal:         { strongBuy: 1.0, buy: 0.4, sell: -0.4, strongSell: -1.0 },
+  aggressive:     { strongBuy: 0.8, buy: 0.3, sell: -0.3, strongSell: -0.8 },
+  veryAggressive: { strongBuy: 0.6, buy: 0.2, sell: -0.2, strongSell: -0.6 },
 };
 
 /**
