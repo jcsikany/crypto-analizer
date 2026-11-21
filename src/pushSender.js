@@ -1,21 +1,23 @@
-// ─── Push Notification Sender ─────────────────────────────────────────────
+// ─── Push Notification Sender v2 — Enhanced Context ──────────────────────────
 const { Expo } = require('expo-server-sdk');
 const { canSendAlert, logAlert, removeDevice } = require('./database');
 
 const expo = new Expo();
 
-const SIGNAL_LABELS = {
-  STRONG_BUY:  { title: '⬆⬆ COMPRA FUERTE',           emoji: '🟢' },
-  BUY:         { title: '⬆ Oportunidad de Compra',      emoji: '🟡' },
-  STRONG_SELL: { title: '⬇⬇ VENTA FUERTE',             emoji: '🔴' },
+// ─── Emoji + labels por zona y señal ─────────────────────────────────────────
+
+const ZONE_LABELS = {
+  ACCUMULATION: '📈 Zona de Acumulación',
+  DISTRIBUTION: '📉 Zona de Distribución',
+  NEUTRAL:      '⚖️ Zona Neutral',
 };
 
-// ─── Evaluar si debe notificar y enviar ───────────────────────────────────
+// ─── Evaluar si debe notificar y enviar ──────────────────────────────────────
 
 async function evaluateAndNotify(devices, masterSignal, asset) {
   if (!masterSignal) return;
 
-  const { score, confidence, signal } = masterSignal;
+  const { score, confidence, signal, zone, regime, confluence } = masterSignal;
   const priceStr = masterSignal.price
     ? `$${Math.round(masterSignal.price).toLocaleString('en-US')}`
     : '';
@@ -37,22 +39,34 @@ async function evaluateAndNotify(devices, masterSignal, asset) {
     let msgBody   = '';
 
     // ── COMPRA FUERTE ────────────────────────────────────────────────
-    if (score >= config.strongThreshold) {
+    if (score >= config.strongThreshold && confluence.ratio >= 0.5) {
       alertType = 'STRONG_BUY';
-      msgTitle  = `⬆⬆ ${asset}: COMPRA FUERTE`;
-      msgBody   = `Score: +${score.toFixed(2)} | Confianza: ${confidence}% | ${priceStr}`;
+      msgTitle  = `🟢 ${asset}: COMPRA FUERTE`;
+      msgBody   = `Score: +${score.toFixed(2)} | Conf: ${confidence}% | ${priceStr}\n` +
+                  `Confluencia: ${Math.round(confluence.ratio * 100)}% | ${regime}`;
+      if (masterSignal.fundamental?.fearGreed !== null) {
+        msgBody += `\nF&G: ${masterSignal.fundamental.fearGreed}`;
+      }
     }
     // ── VENTA FUERTE ─────────────────────────────────────────────────
-    else if (score <= -config.strongThreshold) {
+    else if (score <= -config.strongThreshold && confluence.ratio >= 0.5) {
       alertType = 'STRONG_SELL';
-      msgTitle  = `⬇⬇ ${asset}: VENTA FUERTE`;
-      msgBody   = `Score: ${score.toFixed(2)} | Confianza: ${confidence}% | ${priceStr}`;
+      msgTitle  = `🔴 ${asset}: VENTA FUERTE`;
+      msgBody   = `Score: ${score.toFixed(2)} | Conf: ${confidence}% | ${priceStr}\n` +
+                  `Confluencia: ${Math.round(confluence.ratio * 100)}% | ${regime}`;
     }
-    // ── COMPRA MODERADA (largo plazo) ────────────────────────────────
-    else if (score >= config.moderateThreshold && score < config.strongThreshold) {
+    // ── COMPRA MODERADA ──────────────────────────────────────────────
+    else if (score >= config.moderateThreshold && score < config.strongThreshold && confluence.ratio >= 0.5) {
       alertType = 'MODERATE_BUY';
-      msgTitle  = `⬆ ${asset}: Oportunidad de Compra`;
-      msgBody   = `Score: +${score.toFixed(2)} | Confianza: ${confidence}% | ${priceStr} — Largo plazo`;
+      msgTitle  = `🟡 ${asset}: Oportunidad de Compra`;
+      msgBody   = `Score: +${score.toFixed(2)} | Conf: ${confidence}% | ${priceStr}\n` +
+                  `${ZONE_LABELS[zone] || zone} | ${regime}`;
+    }
+    // ── CAMBIO DE ZONA A ACUMULACIÓN ─────────────────────────────────
+    else if (zone === 'ACCUMULATION' && score > 0) {
+      alertType = 'ZONE_ACCUMULATION';
+      msgTitle  = `📈 ${asset}: Zona de Acumulación`;
+      msgBody   = `Score: +${score.toFixed(2)} | ${priceStr} — Posible momento de compra`;
     }
 
     if (!alertType) continue;
@@ -60,7 +74,7 @@ async function evaluateAndNotify(devices, masterSignal, asset) {
     // Verificar cooldown
     const ok = canSendAlert(device.push_token, asset, alertType, config.cooldownMinutes);
     if (!ok) {
-      console.log(`[${asset}] ${alertType} cooldown activo para ${device.push_token.slice(-8)}`);
+      console.log(`[${asset}] ${alertType} cooldown activo para ...${device.push_token.slice(-8)}`);
       continue;
     }
 
@@ -69,7 +83,10 @@ async function evaluateAndNotify(devices, masterSignal, asset) {
       sound: 'default',
       title: msgTitle,
       body:  msgBody,
-      data:  { type: alertType, asset, score, signal },
+      data:  {
+        type: alertType, asset, score, signal, zone, regime,
+        confidence, confluenceRatio: confluence.ratio,
+      },
       priority: 'high',
       channelId: 'signal-alerts',
       _meta: { pushToken: device.push_token, asset, alertType, score },
@@ -78,7 +95,7 @@ async function evaluateAndNotify(devices, masterSignal, asset) {
 
   if (notifications.length === 0) return;
 
-  // Enviar en chunks (límite de Expo: 100 por batch)
+  // Enviar en chunks
   const chunks = expo.chunkPushNotifications(notifications);
   console.log(`[PUSH] Enviando ${notifications.length} notificacion(es) en ${chunks.length} chunk(s)`);
 
@@ -89,12 +106,10 @@ async function evaluateAndNotify(devices, masterSignal, asset) {
       tickets.forEach((ticket, i) => {
         const meta = chunk[i]._meta;
         if (ticket.status === 'ok') {
-          // Registrar en log para cooldown
           logAlert(meta.pushToken, meta.asset, meta.alertType, meta.score);
-          console.log(`[PUSH ✅] ${meta.asset} ${meta.alertType} → ${meta.pushToken.slice(-8)}`);
+          console.log(`[PUSH ✅] ${meta.asset} ${meta.alertType} → ...${meta.pushToken.slice(-8)}`);
         } else if (ticket.details?.error === 'DeviceNotRegistered') {
-          // Token inválido — eliminar del sistema
-          console.warn(`[PUSH ❌] Token inválido, eliminando: ${meta.pushToken.slice(-8)}`);
+          console.warn(`[PUSH ❌] Token inválido, eliminando: ...${meta.pushToken.slice(-8)}`);
           removeDevice(meta.pushToken);
         } else {
           console.error(`[PUSH ❌] Error: ${ticket.message}`, ticket.details);

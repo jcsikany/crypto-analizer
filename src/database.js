@@ -1,4 +1,4 @@
-// ─── Database (SQLite) ────────────────────────────────────────────────────
+// ─── Database (SQLite) — Enhanced v2 ─────────────────────────────────────────
 const Database = require('better-sqlite3');
 const path = require('path');
 
@@ -10,7 +10,11 @@ fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 const db = new Database(DB_PATH);
 
-// ─── Migrations ───────────────────────────────────────────────────────────
+// Optimizaciones SQLite
+db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');
+
+// ─── Migrations ──────────────────────────────────────────────────────────────
 db.exec(`
   CREATE TABLE IF NOT EXISTS devices (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,9 +41,32 @@ db.exec(`
     score       REAL    NOT NULL,
     sent_at     INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS signal_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset       TEXT    NOT NULL,
+    signal      TEXT    NOT NULL,
+    score       REAL    NOT NULL,
+    confidence  INTEGER NOT NULL,
+    zone        TEXT,
+    regime      TEXT,
+    price       REAL,
+    confluence  REAL,
+    fundamental_score REAL,
+    fear_greed  INTEGER,
+    funding_rate REAL,
+    tf_breakdown TEXT,
+    created_at  INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_signal_history_asset_time
+    ON signal_history(asset, created_at);
+
+  CREATE INDEX IF NOT EXISTS idx_signal_history_signal
+    ON signal_history(asset, signal, created_at);
 `);
 
-// ─── Devices ──────────────────────────────────────────────────────────────
+// ─── Devices ─────────────────────────────────────────────────────────────────
 
 function upsertDevice(pushToken, asset = 'BTC') {
   const now = Date.now();
@@ -61,7 +88,7 @@ function removeDevice(pushToken) {
   db.prepare('DELETE FROM alert_configs WHERE push_token = ?').run(pushToken);
 }
 
-// ─── Alert configs ────────────────────────────────────────────────────────
+// ─── Alert configs ───────────────────────────────────────────────────────────
 
 function upsertAlertConfig(pushToken, config) {
   db.prepare(`
@@ -97,7 +124,7 @@ function getAlertConfig(pushToken) {
   };
 }
 
-// ─── Alert log — cooldown ─────────────────────────────────────────────────
+// ─── Alert log — cooldown ────────────────────────────────────────────────────
 
 function canSendAlert(pushToken, asset, alertType, cooldownMinutes) {
   const cutoff = Date.now() - cooldownMinutes * 60 * 1000;
@@ -107,7 +134,7 @@ function canSendAlert(pushToken, asset, alertType, cooldownMinutes) {
     AND sent_at > ?
     ORDER BY sent_at DESC LIMIT 1
   `).get(pushToken, asset, alertType, cutoff);
-  return !row; // true si puede enviar (no hay registro reciente)
+  return !row;
 }
 
 function logAlert(pushToken, asset, alertType, score) {
@@ -117,8 +144,119 @@ function logAlert(pushToken, asset, alertType, score) {
   `).run(pushToken, asset, alertType, score, Date.now());
 }
 
+// ─── Signal History (backtesting pasivo) ─────────────────────────────────────
+
+function saveSignalHistory(asset, masterSignal) {
+  if (!masterSignal) return;
+
+  db.prepare(`
+    INSERT INTO signal_history (
+      asset, signal, score, confidence, zone, regime, price,
+      confluence, fundamental_score, fear_greed, funding_rate,
+      tf_breakdown, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    asset,
+    masterSignal.signal,
+    masterSignal.score,
+    masterSignal.confidence,
+    masterSignal.zone ?? null,
+    masterSignal.regime ?? null,
+    masterSignal.price ?? null,
+    masterSignal.confluence?.ratio ?? null,
+    masterSignal.fundamental?.score ?? null,
+    masterSignal.fundamental?.fearGreed ?? null,
+    masterSignal.fundamental?.funding ?? null,
+    JSON.stringify(masterSignal.tfBreakdown ?? []),
+    Date.now()
+  );
+}
+
+function getSignalHistory(asset, limit = 100) {
+  return db.prepare(`
+    SELECT * FROM signal_history
+    WHERE asset = ?
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(asset, limit);
+}
+
+function getSignalStats(asset, hours = 24) {
+  const cutoff = Date.now() - hours * 60 * 60 * 1000;
+  const rows = db.prepare(`
+    SELECT signal, COUNT(*) as count, AVG(score) as avg_score,
+           AVG(confidence) as avg_confidence, MIN(price) as min_price,
+           MAX(price) as max_price
+    FROM signal_history
+    WHERE asset = ? AND created_at > ?
+    GROUP BY signal
+    ORDER BY count DESC
+  `).all(asset, cutoff);
+
+  const total = rows.reduce((s, r) => s + r.count, 0);
+  return {
+    period: `${hours}h`,
+    total,
+    signals: rows.map(r => ({
+      signal: r.signal,
+      count: r.count,
+      pct: total > 0 ? +((r.count / total) * 100).toFixed(1) : 0,
+      avgScore: +r.avg_score.toFixed(3),
+      avgConfidence: Math.round(r.avg_confidence),
+      priceRange: { min: r.min_price, max: r.max_price },
+    })),
+  };
+}
+
+// Evaluar precisión: ¿las señales BUY fueron seguidas de subida de precio?
+function evaluateAccuracy(asset, lookbackHours = 168) { // 7 días default
+  const cutoff = Date.now() - lookbackHours * 60 * 60 * 1000;
+  const signals = db.prepare(`
+    SELECT * FROM signal_history
+    WHERE asset = ? AND created_at > ?
+    ORDER BY created_at ASC
+  `).all(asset, cutoff);
+
+  if (signals.length < 10) return null;
+
+  let correct = 0, total = 0;
+  for (let i = 0; i < signals.length - 5; i++) {
+    const s = signals[i];
+    // Buscar precio 5 señales después (~5 minutos si interval es 1min)
+    const future = signals[Math.min(i + 5, signals.length - 1)];
+    if (!s.price || !future.price) continue;
+
+    const priceChange = (future.price - s.price) / s.price;
+    const predictedUp = s.score > 0;
+    const actualUp = priceChange > 0;
+
+    if (s.signal !== 'NEUTRAL') {
+      total++;
+      if (predictedUp === actualUp) correct++;
+    }
+  }
+
+  return {
+    total,
+    correct,
+    accuracy: total > 0 ? +((correct / total) * 100).toFixed(1) : null,
+    period: `${lookbackHours}h`,
+  };
+}
+
+// Limpiar historial viejo (mantener últimos 30 días)
+function cleanOldHistory(daysToKeep = 30) {
+  const cutoff = Date.now() - daysToKeep * 24 * 60 * 60 * 1000;
+  const result = db.prepare('DELETE FROM signal_history WHERE created_at < ?').run(cutoff);
+  if (result.changes > 0) {
+    console.log(`[DB] Limpiados ${result.changes} registros de signal_history`);
+  }
+}
+
 module.exports = {
   upsertDevice, getAllDevices, removeDevice,
   upsertAlertConfig, getAlertConfig,
   canSendAlert, logAlert,
+  saveSignalHistory, getSignalHistory, getSignalStats, evaluateAccuracy,
+  cleanOldHistory,
 };
