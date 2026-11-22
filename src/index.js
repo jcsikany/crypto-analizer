@@ -11,6 +11,7 @@ const {
 } = require('./database');
 const { runBacktest, THRESHOLD_PRESETS } = require('./backtestEngine');
 const { getAccumulationState } = require('./accumulationService');
+const { getEquityState } = require('./equityService');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -148,6 +149,15 @@ app.get('/fundamentals/:asset', auth, (req, res) => {
     return res.status(404).json({ error: 'Sin datos fundamentales aún' });
   }
   res.json(fundamentals[asset]);
+});
+
+// ─── S&P 500 / CSPX: oportunidades de largo plazo ────────────────────────────
+app.get('/equity', auth, (req, res) => {
+  const state = getEquityState();
+  if (!state) {
+    return res.status(503).json({ error: 'Análisis del S&P 500 aún no disponible' });
+  }
+  res.json(state);
 });
 
 // ─── Acumulación de largo plazo (BTC) ────────────────────────────────────────

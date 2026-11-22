@@ -11,6 +11,12 @@ const { runAccumulation } = require('./accumulationService');
 // anterior durante la madrugada UTC) y al arrancar.
 const ACCUMULATION_CRON = '15 6 * * *';
 
+// S&P 500 / CSPX: después del cierre de EE.UU. (20:00–21:00 UTC según horario de verano)
+// y recordatorio trimestral a las 12:00 UTC (09:00 en Uruguay)
+const { runEquity, runEquityReminders } = require('./equityService');
+const EQUITY_CRON = '30 22 * * 1-5';
+const EQUITY_REMINDER_CRON = '0 12 * * *';
+
 // Estado en memoria
 const lastAnalysis = {};
 const lastFundamentals = {};
@@ -139,6 +145,8 @@ function startScheduler(intervalMinutes = 1) {
   });
 
   cron.schedule(ACCUMULATION_CRON, () => runAccumulation(), { timezone: 'UTC' });
+  cron.schedule(EQUITY_CRON, () => runEquity(), { timezone: 'UTC' });
+  cron.schedule(EQUITY_REMINDER_CRON, () => runEquityReminders(), { timezone: 'UTC' });
 
   // Correr inmediatamente al iniciar
   setTimeout(async () => {
@@ -146,6 +154,9 @@ function startScheduler(intervalMinutes = 1) {
     await Promise.allSettled(assets.map(asset => runAnalysis(asset)));
   }, 2000);
   setTimeout(() => runAccumulation(), 5000);
+  // Al arrancar: primero el análisis (así el recordatorio lleva datos) y después
+  // el recordatorio, por si el servidor estuvo caído el día que tocaba
+  setTimeout(async () => { await runEquity(); await runEquityReminders(); }, 8000);
 }
 
 function getLastAnalysis() {

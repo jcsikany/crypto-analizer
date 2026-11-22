@@ -1,6 +1,7 @@
 // ─── Database (SQLite) — Enhanced v2 ─────────────────────────────────────────
 const Database = require('better-sqlite3');
 const path = require('path');
+const { normalizeEquityConfig } = require('./equityEngine');
 
 const DB_PATH = path.join(__dirname, '..', 'data', 'analyzer.db');
 
@@ -71,6 +72,18 @@ const alertConfigColumns = db.prepare('PRAGMA table_info(alert_configs)').all().
 if (!alertConfigColumns.includes('long_term_enabled')) {
   db.exec('ALTER TABLE alert_configs ADD COLUMN long_term_enabled INTEGER NOT NULL DEFAULT 1');
 }
+// Config del módulo S&P 500 / CSPX (JSON); null = valores por defecto
+if (!alertConfigColumns.includes('equity_config')) {
+  db.exec('ALTER TABLE alert_configs ADD COLUMN equity_config TEXT');
+}
+
+function parseEquityConfig(text) {
+  try {
+    return normalizeEquityConfig(text ? JSON.parse(text) : undefined);
+  } catch {
+    return normalizeEquityConfig(undefined);
+  }
+}
 
 // ─── Devices ─────────────────────────────────────────────────────────────────
 
@@ -98,20 +111,25 @@ function removeDevice(pushToken) {
 
 function upsertAlertConfig(pushToken, config) {
   // Si el cliente no manda longTermEnabled (app vieja), se conserva el valor guardado
-  const existing = db.prepare('SELECT long_term_enabled FROM alert_configs WHERE push_token = ?').get(pushToken);
+  const existing = db.prepare('SELECT long_term_enabled, equity_config FROM alert_configs WHERE push_token = ?').get(pushToken);
   const longTermEnabled = typeof config.longTermEnabled === 'boolean'
     ? (config.longTermEnabled ? 1 : 0)
     : (existing?.long_term_enabled ?? 1);
+  // Igual con la config del S&P: si no viene, se conserva la guardada
+  const equityConfig = config.equity && typeof config.equity === 'object'
+    ? JSON.stringify(normalizeEquityConfig(config.equity))
+    : (existing?.equity_config ?? null);
 
   db.prepare(`
-    INSERT INTO alert_configs (push_token, enabled, strong_threshold, moderate_threshold, cooldown_minutes, long_term_enabled, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO alert_configs (push_token, enabled, strong_threshold, moderate_threshold, cooldown_minutes, long_term_enabled, equity_config, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(push_token) DO UPDATE SET
       enabled            = excluded.enabled,
       strong_threshold   = excluded.strong_threshold,
       moderate_threshold = excluded.moderate_threshold,
       cooldown_minutes   = excluded.cooldown_minutes,
       long_term_enabled  = excluded.long_term_enabled,
+      equity_config      = excluded.equity_config,
       updated_at         = excluded.updated_at
   `).run(
     pushToken,
@@ -120,6 +138,7 @@ function upsertAlertConfig(pushToken, config) {
     config.moderateThreshold ?? 0.7,
     config.cooldownMinutes   ?? 60,
     longTermEnabled,
+    equityConfig,
     Date.now()
   );
 }
@@ -130,6 +149,7 @@ function getAlertConfig(pushToken) {
     enabled: true, strongThreshold: 1.3,
     moderateThreshold: 0.7, cooldownMinutes: 60,
     longTermEnabled: true,
+    equity: normalizeEquityConfig(undefined),
   };
   return {
     enabled:            !!row.enabled,
@@ -137,6 +157,7 @@ function getAlertConfig(pushToken) {
     moderateThreshold:  row.moderate_threshold,
     cooldownMinutes:    row.cooldown_minutes,
     longTermEnabled:    row.long_term_enabled !== 0,
+    equity:             parseEquityConfig(row.equity_config),
   };
 }
 

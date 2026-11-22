@@ -127,6 +127,41 @@ async function sendAccumulationAlert(devices, alert, evaluation) {
   await sendChunks(notifications);
 }
 
+// ─── Alertas del S&P 500 / CSPX (texto armado por dispositivo) ───────────────
+
+/**
+ * @param {object[]} devices
+ * @param {(equityConfig: object) => ({alertType,title,body,cooldownMinutes}|null)} buildForConfig
+ * @param {object|null} evaluation  estado actual (para datos y score del log)
+ */
+async function sendEquityNotifications(devices, buildForConfig, evaluation) {
+  const asset = 'SPX';
+  const score = Number.isFinite(evaluation?.dd) ? evaluation.dd : 0;
+  const notifications = [];
+
+  for (const device of devices) {
+    const { equity } = getAlertConfig(device.push_token);
+    if (!equity.enabled) continue;
+    if (!Expo.isExpoPushToken(device.push_token)) continue;
+    const alert = buildForConfig(equity);
+    if (!alert) continue;
+    if (!canSendAlert(device.push_token, asset, alert.alertType, alert.cooldownMinutes)) continue;
+
+    notifications.push({
+      to:    device.push_token,
+      sound: 'default',
+      title: alert.title,
+      body:  alert.body,
+      data:  { type: alert.alertType, asset, asOf: evaluation?.asOf ?? null, screen: 'Equity' },
+      priority: 'high',
+      channelId: 'signal-alerts',
+      _meta: { pushToken: device.push_token, asset, alertType: alert.alertType, score },
+    });
+  }
+
+  await sendChunks(notifications);
+}
+
 // ─── Envío en chunks + manejo de tickets ─────────────────────────────────────
 
 async function sendChunks(notifications) {
@@ -157,4 +192,4 @@ async function sendChunks(notifications) {
   }
 }
 
-module.exports = { evaluateAndNotify, sendAccumulationAlert };
+module.exports = { evaluateAndNotify, sendAccumulationAlert, sendEquityNotifications };
